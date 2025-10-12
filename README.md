@@ -46,7 +46,7 @@ Before you begin, ensure you have the following installed:
 3.  **Install Dependencies**:
 
     ```bash
-    pip install requests beautifulsoup4 openai
+    pip install requests beautifulsoup4 openai pydantic
     ```
 
 ## ⚙️ Configuration

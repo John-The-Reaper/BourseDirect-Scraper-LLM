@@ -2,10 +2,12 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import re
-from openai import OpenAI
+import json
 import logging
+from typing import Literal
+from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
-# Configuration du logging pour le débogage
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 BASE_URL = "https://www.boursedirect.fr"
@@ -86,52 +88,108 @@ def fetch_full_article_text(url, save_html=False):
 
     return article_text
 
-from openai import OpenAI
+class ArticleAnalysis(BaseModel):
+    reasoning: str = Field(..., description="Justification factuelle en 2-3 phrases AVANT de scorer (chain-of-thought)")
+    summary: str = Field(..., description="Résumé en 4-5 phrases")
+    sentiment: int = Field(..., ge=-2, le=2, description="-2 clairement baissier à +2 clairement haussier (0 = neutre)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confiance dans le score, entre 0 et 1")
+    horizon: Literal["court", "moyen", "long"] = Field(..., description="Horizon temporel de l'impact")
+    sectors: list[str] = Field(default_factory=list, description="Secteurs ou actifs impactés")
+    trigger_keywords: list[str] = Field(default_factory=list, description="Mots-clés déclencheurs du sentiment")
 
-def query_llm_via_lmstudio(text):
-    client = OpenAI(
-        api_key="lm-studio",  # Clé ignorée par LM Studio
-        base_url="http://localhost:1234/v1"
+
+SYSTEM_PROMPT = """Tu es un analyste financier senior spécialisé dans l'analyse de sentiment de news boursières françaises et internationales.
+Tu réponds UNIQUEMENT avec un objet JSON valide respectant strictement le schéma fourni — sans texte avant ni après, sans bloc markdown.
+Tu raisonnes brièvement dans le champ 'reasoning' AVANT de produire le score, pour ancrer ta décision sur des faits de l'article."""
+
+
+FEW_SHOT_EXAMPLES = [
+    {
+        "article": "Apple publie un chiffre d'affaires trimestriel record de 123 milliards de dollars, en hausse de 11% sur un an, porté par les ventes d'iPhone. Le titre gagne 5% en after-hours.",
+        "output": {
+            "reasoning": "CA record + croissance à deux chiffres + réaction immédiate très positive du marché (+5%). Signal clairement haussier, faits concordants.",
+            "summary": "Apple annonce un trimestre record avec 123 Mds$ de chiffre d'affaires, en croissance de 11% en glissement annuel. La performance est principalement tirée par les ventes d'iPhone. Le marché réagit favorablement avec une hausse de 5% du titre en after-hours. Les indicateurs financiers dépassent les attentes du consensus.",
+            "sentiment": 2,
+            "confidence": 0.9,
+            "horizon": "court",
+            "sectors": ["technologie", "smartphones"],
+            "trigger_keywords": ["chiffre d'affaires record", "hausse 11%", "+5% after-hours"]
+        }
+    },
+    {
+        "article": "La BCE relève ses taux directeurs de 50 points de base pour la sixième fois consécutive. Christine Lagarde évoque de futures hausses pour combattre l'inflation persistante.",
+        "output": {
+            "reasoning": "Resserrement monétaire prolongé + guidance hawkish explicite. Négatif pour actifs risqués et activité économique, mais largement anticipé donc impact modéré.",
+            "summary": "La BCE poursuit son cycle de resserrement en relevant ses taux directeurs de 50 points de base pour la sixième fois consécutive. Christine Lagarde indique que d'autres hausses sont à prévoir afin de lutter contre une inflation jugée persistante. La posture reste résolument restrictive. La décision pèse sur les actifs risqués et la croissance à moyen terme.",
+            "sentiment": -1,
+            "confidence": 0.75,
+            "horizon": "moyen",
+            "sectors": ["banques", "immobilier", "actions européennes"],
+            "trigger_keywords": ["hausse 50 pb", "inflation persistante", "futures hausses"]
+        }
+    }
+]
+
+
+def build_user_prompt(article_text: str) -> str:
+    schema = json.dumps(ArticleAnalysis.model_json_schema(), ensure_ascii=False, indent=2)
+    examples_block = "\n\n".join(
+        f"### Exemple {i+1}\nArticle :\n{ex['article']}\n\nRéponse JSON :\n{json.dumps(ex['output'], ensure_ascii=False, indent=2)}"
+        for i, ex in enumerate(FEW_SHOT_EXAMPLES)
     )
-    
-    prompt = f"""
-Lis attentivement cet article de presse économique et fais deux choses :
+    return f"""Analyse l'article ci-dessous et retourne un JSON conforme à ce schéma :
 
-1. Résume le contenu en 4-5 phrases.
-2. Donne une **analyse de tendance** sous forme de score :
-   - +1 si l'article est légèrement haussier
-   - +2 si clairement haussier
-   - -1 si légèrement baissier
-   - -2 si clairement baissier
-   - 0 si neutre
+{schema}
 
-Réponds dans ce format :
-Résumé : ...
-Tendance : ...
-Texte :
-{text}
+{examples_block}
+
+### Article à analyser
+{article_text}
+
+### Réponse JSON
 """
+
+
+def query_llm_via_lmstudio(text: str) -> "ArticleAnalysis | None":
+    client = OpenAI(api_key="lm-studio", base_url="http://localhost:1234/v1")
     try:
         response = client.chat.completions.create(
             model="mistral-7b-instruct-v0.2-GGUF",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=500
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(text)},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.content
+        raw = response.choices[0].message.content
     except Exception as e:
         logging.error(f"Erreur LLM : {e}")
-        return f"Erreur lors de l'analyse par le modèle : {str(e)}"
+        return None
+
+    return parse_analysis(raw)
 
 
+def parse_analysis(raw: str) -> "ArticleAnalysis | None":
+    payload = raw.strip()
+    if payload.startswith("```"):
+        payload = re.sub(r"^```(?:json)?\s*|\s*```$", "", payload, flags=re.MULTILINE).strip()
+    if not payload.startswith("{"):
+        match = re.search(r"\{.*\}", payload, re.DOTALL)
+        if not match:
+            logging.error(f"Pas de JSON détecté dans la réponse LLM : {raw[:200]}")
+            return None
+        payload = match.group(0)
 
-
-def extract_score_from_llm_output(output):
-    match = re.search(r"Tendance\s*:\s*([+-]?\d+)", output)
-    if not match:
-        logging.warning("Format de tendance invalide, retour à 0.")
-        return 0
-    return int(match.group(1))
+    try:
+        return ArticleAnalysis.model_validate_json(payload)
+    except ValidationError as e:
+        logging.error(f"Validation Pydantic échouée : {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON invalide : {e} | payload: {payload[:200]}")
+        return None
 
 def scrape_and_analyze(save_html=True):
     articles = extract_articles_from_main_page()
@@ -150,13 +208,22 @@ def scrape_and_analyze(save_html=True):
             print(f"📄 Contenu brut non disponible, vérifiez le fichier HTML sauvegardé ou le log.")
             continue
 
-        print(f"📄 Contenu extrait :\n{full_text[:1000]}...")  # Affiche les 1000 premiers caractères
-        llm_output = query_llm_via_lmstudio(full_text)
-        trend_score = extract_score_from_llm_output(llm_output)
+        print(f"📄 Contenu extrait :\n{full_text[:1000]}...")
+        analysis = query_llm_via_lmstudio(full_text)
 
-        print("\n📃 Réponse du LLM :")
-        print(llm_output)
-        print(f"📊 Trend Score (extrait) : {trend_score}")
+        if analysis is None:
+            print("❌ Analyse LLM indisponible (voir logs).")
+            print("-" * 80)
+            continue
+
+        print("\n📃 Analyse :")
+        print(f"  💭 Raisonnement : {analysis.reasoning}")
+        print(f"  📝 Résumé       : {analysis.summary}")
+        print(f"  📊 Sentiment    : {analysis.sentiment:+d}")
+        print(f"  🎯 Confiance    : {analysis.confidence:.0%}")
+        print(f"  ⏳ Horizon      : {analysis.horizon} terme")
+        print(f"  🏭 Secteurs     : {', '.join(analysis.sectors) or '—'}")
+        print(f"  🔑 Mots-clés    : {', '.join(analysis.trigger_keywords) or '—'}")
         print("-" * 80)
         time.sleep(1)
 
